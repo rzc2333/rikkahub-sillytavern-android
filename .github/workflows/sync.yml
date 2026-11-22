@@ -1,0 +1,127 @@
+name: Sync Upstream (huadeng)
+
+# 每天：抓取上游 → 合并 → 删掉仓库守卫（build.yml 的 if 守卫）→ 推送
+# 无冲突：自动合并并推送，绿灯，不用管
+# 有冲突：放弃自动合并，改为自动创建 PR（在 Pull requests 页面手动解决），本 run 标红
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # UTC 01:00 = 北京/新加坡时间 09:00，可自行调整
+  workflow_dispatch:       # 支持在 Actions 页面手动触发
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-huadeng
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: MiaoWuNYA/rikkahub-sillytavern-android
+      UPSTREAM_BRANCH: huadeng
+      PR_BRANCH: sync-upstream
+    steps:
+      - name: Checkout huadeng
+        uses: actions/checkout@v4
+        with:
+          ref: huadeng
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}" --no-tags
+
+      - name: Try auto merge
+        id: merge
+        run: |
+          set +e
+          git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ] && [ -f .git/MERGE_HEAD ]; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 0 ]; then
+            echo "result=up_to_date" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > conflict_files.txt || true
+            [ -s conflict_files.txt ] || echo "(详见 Actions 运行日志)" >> conflict_files.txt
+            git merge --abort || true
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ===== 无冲突：恢复本仓库 build.yml（删掉上游守卫），提交合并并推送 =====
+      - name: Merged - drop guard, commit, push
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          # 上游 build.yml 带守卫：if: github.repository == 'MiaoWuNYA/rikkahub-sillytavern-android'
+          # 本仓库已删守卫，无论上游怎么改这个文件，一律恢复成本仓库版本
+          git checkout HEAD -- .github/workflows/build.yml
+          if git diff --quiet HEAD; then
+            git merge --abort || true
+            echo "上游只有 build.yml（守卫）差异，已按本仓库版本忽略，无需推送" >> "$GITHUB_STEP_SUMMARY"
+          else
+            git commit -m "chore(sync): merge upstream ${UPSTREAM_BRANCH} @ $(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+            git push origin huadeng
+            echo "✅ 已自动合并上游 $(git rev-parse --short "upstream/${UPSTREAM_BRANCH}") 并推送到 huadeng（build.yml 守卫已移除）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Up to date
+        if: steps.merge.outputs.result == 'up_to_date'
+        run: echo "✅ 上游无新提交，无需同步" >> "$GITHUB_STEP_SUMMARY"
+
+      # ===== 有冲突：把上游 tip 推成 sync-upstream 分支并创建 PR，本 run 标红 =====
+      - name: Conflict - create PR, mark red
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          up_sha="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+          git push --force origin "upstream/${UPSTREAM_BRANCH}:refs/heads/${PR_BRANCH}"
+
+          {
+            echo "## ⚠️ 上游同步冲突，需要人工解决"
+            echo ""
+            echo "- 上游提交：${UPSTREAM_REPO} @ ${up_sha}"
+            echo "- 目标分支：huadeng（本仓库）"
+            echo ""
+            echo "### 撞车文件"
+            sed 's/^/- /' conflict_files.txt
+            echo ""
+            echo "### 处理步骤（全程网页操作，无需本地）"
+            echo "1. 打开本 PR，点 Resolve conflicts；"
+            echo "2. 逐个撞车文件选择：保留官方的 / 保留你的 / 手动编辑；"
+            echo "3. .github/workflows/build.yml 请一律保留你的版本（本仓库已删上游守卫，别让 if: github.repository == 'MiaoWuNYA/...' 这行回来）；"
+            echo "4. 全部改完点 Mark as resolved，然后合并本 PR 即可。"
+          } > pr_body.md
+
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "${PR_BRANCH}" --state open --json number -q '.[0].number' || true)"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "$GITHUB_REPOSITORY" \
+              --title "⚠️ 上游同步冲突 @ ${up_sha}：请手动解决" --body-file pr_body.md
+            pr_url="$(gh pr view "$existing" --repo "$GITHUB_REPOSITORY" --json url -q .url)"
+          else
+            pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base huadeng --head "${PR_BRANCH}" \
+              --title "⚠️ 上游同步冲突 @ ${up_sha}：请手动解决" --body-file pr_body.md)"
+          fi
+
+          {
+            echo "## 上游同步冲突"
+            echo ""
+            echo "PR：${pr_url}"
+            echo ""
+            sed 's/^/- /' conflict_files.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::上游有冲突，已放弃自动合并。请到仓库 Pull requests 页面解决冲突：${pr_url}"
+          exit 1
