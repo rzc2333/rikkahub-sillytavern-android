@@ -222,6 +222,11 @@
   <string name="backup_page_import_from_chatbox">Import from ChatBox</string>
   <string name="backup_page_import_from_cherry_studio">Import from Cherry Studio</string>
   <string name="backup_page_import_from_other_app">Import from other app</string>
+  <string name="backup_page_import_from_st_jsonl">Import SillyTavern chat (.jsonl)</string>
+  <string name="backup_page_import_st_jsonl_complete">SillyTavern chat imported</string>
+  <string name="backup_page_import_st_jsonl_desc">Import a SillyTavern .jsonl chat history as a new conversation for the current assistant. Importing again adds another conversation instead of overwriting</string>
+  <string name="backup_page_import_st_jsonl_summary">Title: %1$s\nMessages imported: %2$d\nImages skipped: %3$d</string>
+  <string name="backup_page_import_st_jsonl_too_large">Chat archive is too large (limit: 512 MB)</string>
   <string name="backup_page_importing">Importing...</string>
   <string name="backup_page_loading_failed">Failed to load backup files: %s</string>
   <string name="backup_page_local_backup_export">Export to File</string>

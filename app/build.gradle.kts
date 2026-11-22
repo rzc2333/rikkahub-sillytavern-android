@@ -231,10 +231,14 @@ android {
         // 配合公开的签名证书即可完整复现密钥派生、解开插件载荷。
         // 因子现由 libhdguard.so 在运行时供给（见 app/src/main/cpp/hdguard.c），
         // 上面算出的 kdfFactor 仍用于校验 native 侧数据的一致性，但不进入 APK。
-        check(kdfFactor == HD_GUARD_EXPECTED_FACTOR) {
-            "[华灯] 签名口令推导出的因子与 libhdguard.so 内置值不一致。" +
-                "两者必须相同，否则 APK 无法解密 v2 插件。" +
-                "请重新生成 hdguard.c 中的 BLOB，或检查 local.properties 的签名口令。"
+        // fork / 未注入官方 secrets 的构建口令必然不同，这里降级为告警、不再中断构建：
+        // 运行时插件解密因子由 libhdguard.so 供给，与本次构建使用的签名口令无关。
+        if (kdfFactor != HD_GUARD_EXPECTED_FACTOR) {
+            logger.warn(
+                "[华灯] 签名口令推导出的因子与 libhdguard.so 内置值不一致，" +
+                    "本次构建的 APK 无法解密 v2 加密插件（其余功能不受影响）。" +
+                    "官方发布构建请配置正确的签名口令 secrets。"
+            )
         }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -276,6 +280,8 @@ android {
                     keyAliasValue != null && keyPasswordValue != null
                 ) {
                     storeFile = file(storeFilePath)
+                    // 允许 local.properties 显式指定库类型（如 CI 现场生成的 PKCS12 调试库）
+                    localProperties.getProperty("storeType")?.let { storeType = it }
                     storePassword = storePasswordValue
                     keyAlias = keyAliasValue
                     keyPassword = keyPasswordValue

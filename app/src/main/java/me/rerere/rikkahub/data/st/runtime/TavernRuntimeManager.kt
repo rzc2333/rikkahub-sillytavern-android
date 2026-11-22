@@ -911,12 +911,26 @@ object TavernRuntimeManager {
     private val bootRecords = ConcurrentLinkedQueue<WebViewBootRecord>()
     private const val MAX_BOOT_RECORDS = 240
 
+    /** 去重记录的高频阶段（如 first_interaction 随每次触摸触发），避免日志洪水拖慢主线程。 */
+    private val recordedBootStageKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     fun recordWebViewBootStage(
         hostType: String,
         hostId: String,
         stage: String,
         detail: String = "",
+        dedupe: Boolean = false,
     ): WebViewBootRecord {
+        val dedupeKey = "$hostType:$hostId:$stage"
+        if (dedupe && !recordedBootStageKeys.add(dedupeKey)) {
+            return WebViewBootRecord(
+                seq = 0,
+                hostType = hostType,
+                hostId = hostId,
+                stage = stage,
+                detail = detail,
+            )
+        }
         val rec = WebViewBootRecord(
             seq = bootRecordSeq.incrementAndGet(),
             hostType = hostType,

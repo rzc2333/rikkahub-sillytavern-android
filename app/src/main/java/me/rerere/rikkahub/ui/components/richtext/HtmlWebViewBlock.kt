@@ -19,6 +19,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,6 +53,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -108,8 +110,15 @@ fun HtmlWebViewBlock(
     val panelKey = remember(messageKey, contentHash) {
         if (messageKey.isNotBlank()) messageKey else "panel#" + contentHash
     }
-    val foregroundHex = remember(colorScheme.onSurface) {
-        String.format(Locale.US, "#%06X", 0xFFFFFF and colorScheme.onSurface.toArgb())
+    // 面板背景透明、透出 App 界面底色：文字颜色按底色亮度取深/浅——
+    // 浅色主题→深色文字、深色主题→浅色文字，任何主题下都清晰可读。
+    val foregroundHex = remember(colorScheme.surface) {
+        val fgInt = if (colorScheme.surface.luminance() > 0.5f) {
+            0xFF1B1B1B.toInt()
+        } else {
+            0xFFE6E6E6.toInt()
+        }
+        String.format(Locale.US, "#%06X", 0xFFFFFF and fgInt)
     }
 
     val mountState = remember(panelKey) {
@@ -128,6 +137,13 @@ fun HtmlWebViewBlock(
     val activeKeys by ActivePanelWebViewPool.activeKeys.collectAsState()
     val hibernated = slotGranted && !activeKeys.contains(panelKey)
 
+    // 休眠诊断：占位卡出现（面板被池淘汰/释放）时记录，配合日志定位「变色」问题
+    LaunchedEffect(hibernated, panelKey) {
+        if (hibernated) {
+            TavernRuntimeManager.appendLog("debug", "[panel] hibernate key=$panelKey (not in active pool)")
+        }
+    }
+
     LaunchedEffect(panelKey) {
         val slot = TavernPanelLoadScheduler.enqueue(panelKey, panelTitle)
         stage = PanelLoadStage.Queued(
@@ -142,6 +158,9 @@ fun HtmlWebViewBlock(
     }
     DisposableEffect(panelKey) {
         onDispose {
+            // 诊断：面板离开组合（消息滚出视口被销毁等）时记录，配合 [panel] hibernate
+            // 日志可确认「变色占位卡」出现的确切路径。
+            TavernRuntimeManager.appendLog("debug", "[panel] onDispose release key=$panelKey")
             TavernPanelLoadScheduler.cancel(panelKey)
             ActivePanelWebViewPool.release(panelKey)
         }
@@ -210,6 +229,11 @@ fun HtmlWebViewBlock(
                         manualReload = false,
                     ),
                     onReload = reloadPanel,
+                    onWake = {
+                        ActivePanelWebViewPool.acquire(panelKey)
+                        slotGranted = true
+                        stage = PanelLoadStage.LoadingWebView(panelTitle)
+                    },
                 )
             } else {
                 key(rendererEpoch) {
@@ -369,16 +393,28 @@ private fun createPanelContainer(
         isFocusableInTouchMode = false
         isLongClickable = false
         setOnTouchListener { v, event ->
+            ActivePanelWebViewPool.touch(key)
             if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                ActivePanelWebViewPool.touch(key)
-                TavernRuntimeManager.recordWebViewBootStage("panel", key, "first_interaction")
+                TavernRuntimeManager.recordWebViewBootStage(
+                    "panel",
+                    key,
+                    "first_interaction",
+                    dedupe = true,
+                )
                 if (event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER) {
                     isFocusable = true
                     isFocusableInTouchMode = true
                 }
             }
             if (v is WebView && event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER) {
-                v.requestDisallowInterceptTouchEvent(false)
+                // 内容溢出容器（高度上报未跟上的边缘态）时，滑动先归面板内部滚动——
+                // 否则列表拦截触摸后，WebView 只能靠长按选字才能滚。自适应完好、
+                // 不溢出的面板维持原行为：滑动交给外层消息列表。
+                // 溢出判定：只要面板内容能滚（或已滚动），滑动就归面板内部——
+                // 滑到底后仍保持归面板（overScroll 回弹），避免列表接管把整条
+                // 消息滚出视口 → item 被销毁 → 面板休眠成浅色占位卡。
+                val overflowed = v.scrollY > 0 || v.canScrollVertically(1) || v.canScrollVertically(-1)
+                v.requestDisallowInterceptTouchEvent(overflowed)
             }
             false
         }
@@ -524,10 +560,13 @@ private fun PanelStatusPlaceholder(
     title: String,
     statusText: String,
     onReload: () -> Unit,
+    onWake: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Card(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(onClick = onWake),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow,

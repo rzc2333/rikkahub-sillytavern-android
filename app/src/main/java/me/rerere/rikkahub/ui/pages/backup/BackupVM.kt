@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.ui.pages.backup
 
 import android.app.Application
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.util.Log
 import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
@@ -19,6 +21,7 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.files.saveUploadFromBytes
 import me.rerere.rikkahub.data.model.bindConfig
 import me.rerere.rikkahub.data.repository.ConversationRepository
+import me.rerere.rikkahub.data.st.runtime.importConversationFromStJsonl
 import me.rerere.rikkahub.data.sync.BackupManager
 import me.rerere.rikkahub.data.sync.S3BackupItem
 import me.rerere.rikkahub.data.sync.S3Sync
@@ -30,8 +33,13 @@ import me.rerere.rikkahub.data.sync.webdav.WebDavBackupItem
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
 import me.rerere.rikkahub.utils.UiState
 import java.io.File
+import java.io.FilterInputStream
+import java.io.InputStream
 
 private const val TAG = "BackupVM"
+
+/** 单份 `.jsonl` 聊天存档的大小上限，与 RPClient 的导入限制一致。 */
+private const val MAX_ST_JSONL_BYTES = 512L * 1024 * 1024
 
 class BackupVM(
     private val context: Application,
@@ -228,6 +236,63 @@ class BackupVM(
         }
     }
 
+    /**
+     * 从 SAF Uri 读取 SillyTavern `.jsonl` 聊天记录，导入为当前助手下的**全新会话**。
+     *
+     * 每次调用都生成随机会话 ID 并纯插入：先导入 a.jsonl 再导入 b.jsonl 会得到两个会话，
+     * 后者不会覆盖或修改前者。文件里出现的图片只计数不恢复（.jsonl 往往不含图片字节）。
+     */
+    suspend fun importStJsonlFromUri(uri: Uri): StJsonlChatImportResult = withContext(Dispatchers.IO) {
+        val currentSettings = settingsStore.awaitLoaded()
+        val displayName = queryStJsonlDisplayName(uri)
+        val parsed = importConversationFromStJsonl(
+            jsonl = readStJsonlText(uri),
+            assistantId = currentSettings.assistantId,
+            title = displayName
+                ?.removeSuffix(".jsonl")
+                ?.removeSuffix(".json")
+                .orEmpty(),
+        )
+        conversationRepository.insertConversation(parsed.conversation.bindConfig(currentSettings))
+        Log.i(
+            TAG,
+            "importStJsonlFromUri: import 1 conversation (${parsed.messageCount} messages), " +
+                "skip ${parsed.skippedImages} images"
+        )
+        StJsonlChatImportResult(
+            title = parsed.conversation.title,
+            messageCount = parsed.messageCount,
+            skippedImages = parsed.skippedImages,
+        )
+    }
+
+    private fun queryStJsonlDisplayName(uri: Uri): String? = runCatching {
+        context.contentResolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) null
+            else cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+        }
+    }.getOrNull()
+
+    /** 先按文件声明大小快速拒绝，读取时再用限流流兜底，防止超大文件撑爆内存。 */
+    private fun readStJsonlText(uri: Uri): String {
+        val tooLargeMessage = context.getString(R.string.backup_page_import_st_jsonl_too_large)
+        val declaredSize = runCatching {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+        }.getOrDefault(-1L)
+        require(declaredSize <= MAX_ST_JSONL_BYTES) { tooLargeMessage }
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val limited = StJsonlSizeLimitedInputStream(input, MAX_ST_JSONL_BYTES, tooLargeMessage)
+            return limited.readBytes().toString(Charsets.UTF_8)
+        }
+        error("Unable to read the SillyTavern chat archive")
+    }
+
     // S3 Backup methods
     fun loadS3BackupFileItems() {
         viewModelScope.launch {
@@ -284,3 +349,33 @@ data class ChatboxRestoreResult(
     val skippedForkMessages: Int,
     val skippedSessions: Int,
 )
+
+/** SillyTavern `.jsonl` 单文件导入结果，用于导入完成提示。 */
+data class StJsonlChatImportResult(
+    val title: String,
+    val messageCount: Int,
+    val skippedImages: Int,
+)
+
+/** 读取时累计字节数的限流流：超过上限立即失败，避免超大文件撑爆内存。 */
+private class StJsonlSizeLimitedInputStream(
+    input: InputStream,
+    private val maxBytes: Long,
+    private val tooLargeMessage: String,
+) : FilterInputStream(input) {
+    private var totalBytes = 0L
+
+    override fun read(): Int = super.read().also { value ->
+        if (value >= 0) recordBytes(1)
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+        super.read(buffer, offset, length).also { count ->
+            if (count > 0) recordBytes(count)
+        }
+
+    private fun recordBytes(byteCount: Int) {
+        totalBytes += byteCount
+        require(totalBytes <= maxBytes) { tooLargeMessage }
+    }
+}

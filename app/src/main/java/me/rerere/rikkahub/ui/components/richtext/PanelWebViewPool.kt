@@ -9,6 +9,7 @@ import android.widget.FrameLayout
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import me.rerere.rikkahub.data.st.runtime.TavernRuntimeManager
 
 private const val POOL_TAG = "PanelPool"
 
@@ -36,7 +37,7 @@ internal object ActivePanelWebViewPool {
             }
             lruKeys.add(key)
             publish()
-            Log.i(POOL_TAG, "[panel-pool] acquire key=$key active=${lruKeys.size}/$MAX_ACTIVE_PANEL_WEBVIEWS")
+            TavernRuntimeManager.appendLog("debug", "[panel-pool] acquire key=$key active=${lruKeys.size}/$MAX_ACTIVE_PANEL_WEBVIEWS")
         }
         for (old in evicted) {
             DetachedPanelWebViewCache.evictAndDestroy(old)
@@ -47,6 +48,10 @@ internal object ActivePanelWebViewPool {
         synchronized(lock) {
             if (lruKeys.remove(key)) {
                 lruKeys.add(key)
+                // 顺序变化不改变活跃集合内容，不 publish——滑动时每个触摸事件都会
+                // 走到这里，若发布会让所有面板重组，造成明显卡顿。
+            } else {
+                lruKeys.add(key)
                 publish()
             }
         }
@@ -56,7 +61,7 @@ internal object ActivePanelWebViewPool {
         synchronized(lock) {
             if (lruKeys.remove(key)) {
                 publish()
-                Log.i(POOL_TAG, "[panel-pool] release key=$key active=${lruKeys.size}/$MAX_ACTIVE_PANEL_WEBVIEWS")
+                TavernRuntimeManager.appendLog("debug", "[panel-pool] release key=$key active=${lruKeys.size}/$MAX_ACTIVE_PANEL_WEBVIEWS")
             }
         }
     }
@@ -115,7 +120,7 @@ internal object DetachedPanelWebViewCache {
                 }
             }
         }
-        Log.i(POOL_TAG, "[panel-pool] take key=$key cached=${entries.size}/$MAX_DETACHED_WEBVIEWS")
+        TavernRuntimeManager.appendLog("debug", "[panel-pool] take key=$key cached=${entries.size}/$MAX_DETACHED_WEBVIEWS")
         entry
     }
 
@@ -132,14 +137,14 @@ internal object DetachedPanelWebViewCache {
         }
         (container.parent as? ViewGroup)?.removeView(container)
         container.getChildAt(0)?.let { wv -> runCatching { (wv as WebView).onPause() } }
-        Log.i(POOL_TAG, "[panel-pool] parked key=$key cached=${size()}/$MAX_DETACHED_WEBVIEWS")
+        TavernRuntimeManager.appendLog("debug", "[panel-pool] parked key=$key cached=${size()}/$MAX_DETACHED_WEBVIEWS")
         overflow.forEach { destroy(it) }
     }
 
     fun evictAndDestroy(key: String) {
         val victim = synchronized(lock) { entries.remove(key) }
         if (victim != null) {
-            Log.i(POOL_TAG, "[panel-pool] cache evict key=$key cached=${size()}/$MAX_DETACHED_WEBVIEWS")
+            TavernRuntimeManager.appendLog("debug", "[panel-pool] cache evict key=$key cached=${size()}/$MAX_DETACHED_WEBVIEWS")
             destroy(victim)
         }
     }

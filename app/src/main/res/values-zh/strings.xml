@@ -222,6 +222,11 @@
   <string name="backup_page_import_from_chatbox">从ChatBox导入</string>
   <string name="backup_page_import_from_cherry_studio">从Cherry Studio导入</string>
   <string name="backup_page_import_from_other_app">从其他APP导入</string>
+  <string name="backup_page_import_from_st_jsonl">导入酒馆聊天记录（.jsonl）</string>
+  <string name="backup_page_import_st_jsonl_complete">酒馆聊天记录导入完成</string>
+  <string name="backup_page_import_st_jsonl_desc">将 SillyTavern .jsonl 聊天记录导入为当前助手下的新会话；重复导入会新增会话，不会覆盖已有会话</string>
+  <string name="backup_page_import_st_jsonl_summary">标题：%1$s\n导入消息：%2$d 条\n跳过图片：%3$d 张（本次导入未恢复图片）</string>
+  <string name="backup_page_import_st_jsonl_too_large">聊天存档过大（上限 512 MB）</string>
   <string name="backup_page_importing">正在恢复...</string>
   <string name="backup_page_loading_failed">加载备份文件失败: %s</string>
   <string name="backup_page_local_backup_export">导出为文件</string>

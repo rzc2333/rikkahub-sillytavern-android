@@ -4443,6 +4443,24 @@ function syncThirdPartyExtensionMetadata() {
     } catch (_e) { /* noop */ }
 }
 
+/**
+ * fork：状态卡常把整个状态栏写成一行（条目间只用「 - 」分隔）。pre-wrap 下面板
+ * 会把这一行折成几十行，高度冲破渲染上限（触发截断/内部滚动/占位变色）。
+ * 这里把 <details> 内文本里的「 - 」分隔符断成换行，行数恢复到桌面端的观感。
+ */
+function formatDetailsStatusLines(scope) {
+    try {
+        scope.querySelectorAll('details').forEach((d) => {
+            const walker = document.createTreeWalker(d, NodeFilter.SHOW_TEXT, {
+                acceptNode: (n) => (n.nodeValue && n.nodeValue.indexOf(' - ') >= 0 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP),
+            });
+            const hits = [];
+            while (walker.nextNode()) hits.push(walker.currentNode);
+            hits.forEach((n) => { n.nodeValue = String(n.nodeValue).replace(/ - /g, '\n- '); });
+        });
+    } catch (_e) { /* noop */ }
+}
+
 function installPanelMode() {
     const root = document.getElementById('rikka-panel-root') || document.body;
     // [v243 BUGFIX D1] 稳定视口高度：绝不能用 window.innerHeight（那就是被 ResizeObserver
@@ -4943,7 +4961,20 @@ function installPanelMode() {
             }
         } catch (_e) { /* noop */ }
         try {
+            // fork 加固：重挂会重建 DOM，把用户已展开的 <details>（状态栏等）重新合上，
+            // 表现为「展开 [角色状态] 后又被盖住」。重挂前快照展开状态，挂载后按位恢复。
+            const detailsOpenBefore = Array.from(root.querySelectorAll('details')).map((d) => d.hasAttribute('open'));
             root.innerHTML = normalizeHtml(html);
+            if (detailsOpenBefore.some(Boolean)) {
+                const detailsAfter = Array.from(root.querySelectorAll('details'));
+                detailsOpenBefore.forEach((isOpen, di) => {
+                    if (isOpen && detailsAfter[di]) detailsAfter[di].setAttribute('open', '');
+                });
+                try { RikkaPanel.log('debug', '[panel] details restored ' + detailsOpenBefore.filter(Boolean).length + '/' + detailsOpenBefore.length + ' (' + t + ')'); } catch (_e) { /* noop */ }
+            }
+            // fork：状态卡常把整个状态栏写成一行（条目间只用「 - 」分隔），pre-wrap 下
+            // 会折成几十行、高度冲破面板渲染上限（触发截断/内部滚动/占位变色）。按分隔符断行。
+            formatDetailsStatusLines(root);
             Promise.resolve()
                 .then(() => (/katex|\$\$|\\\(|\\\[/i.test(String(html || '')) ? ensurePanelKatex() : null))
                 .then(() => runScripts(root))

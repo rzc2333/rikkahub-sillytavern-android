@@ -1,7 +1,14 @@
 package me.rerere.rikkahub.data.st.runtime
 
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -10,6 +17,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
@@ -411,40 +419,103 @@ fun exportConversationToStJsonl(
 }
 
 /**
- * 从官方 SillyTavern `.jsonl` 聊天记录文本无损导入为 Conversation（支持多 swipes、is_user、is_system 隐藏标志与消息级 variables）。
+ * ST `.jsonl` 聊天记录导入结果。
+ *
+ * @param conversation 解析出的会话；每次调用都生成全新 ID，重复导入即追加新会话、不覆盖旧会话。
+ * @param messageCount 导入的消息楼层数。
+ * @param skippedImages 文件里出现但本次导入未恢复的图片数量（内嵌与路径引用均计入）。
+ */
+data class StJsonlImportResult(
+    val conversation: Conversation,
+    val messageCount: Int,
+    val skippedImages: Int,
+)
+
+/** epoch 秒/毫秒归一阈值：绝对值小于该值按秒处理，与 RPClient 归档规则一致。 */
+private const val ST_JSONL_SECONDS_EPOCH_THRESHOLD = 100_000_000_000L
+
+/** 单份聊天存档允许的最大消息楼层数，超过直接判定为非法文件。 */
+private const val ST_JSONL_MAX_MESSAGES = 100_000
+
+/** SillyTavern humanizedDateTime() 的遗留格式，如 `2024-1-5 @14h 30m 25s 500ms`。 */
+private val stJsonlLegacySendDateRegex = Regex(
+    pattern = """^(\d{4})-(\d{1,2})-(\d{1,2})\s*@?(\d{1,2})h\s+(\d{1,2})m\s+(\d{1,2})s\s+(\d{1,3})ms$""",
+)
+
+/**
+ * 从官方 SillyTavern `.jsonl` 聊天记录文本无损导入为 Conversation。
+ *
+ * - 首行 header（user_name / character_name / chat_metadata）提供标题与创建时间；
+ *   RPClient 私有命名空间 `chat_metadata.rpclient` 的 title / create_time / latest_time 优先。
+ * - 每行消息支持多 swipes（映射为 MessageNode 分支）、is_user、is_system（保留为隐藏消息）、
+ *   `extra.type = narrator` 旁白（保留为隐藏的 assistant 消息）与多格式 send_date 时间戳。
+ * - 时间戳按 RPClient 规则单调化：乱序或缺失时取前一条 +1ms，保证导入后楼层顺序稳定。
+ * - 图片字段只统计数量（[StJsonlImportResult.skippedImages]），不恢复图片字节。
  */
 fun importConversationFromStJsonl(
     jsonl: String,
     assistantId: kotlin.uuid.Uuid = kotlin.uuid.Uuid.random(),
     title: String = "",
-): Conversation {
+): StJsonlImportResult {
     val rawLines = jsonl.lines().map { it.trim() }.filter { it.isNotEmpty() }
     val nodes = mutableListOf<me.rerere.rikkahub.data.model.MessageNode>()
-    var resolvedTitle = title
+    var skippedImages = 0
+    var headerCharacterName: String? = null
+    var headerCreateDate: JsonElement? = null
+    var rpClientMeta: JsonObject? = null
+    var previousMillis = Long.MIN_VALUE
+    var firstMillis: Long? = null
+    var lastMillis: Long? = null
+
     for ((idx, line) in rawLines.withIndex()) {
         val obj = runCatching { Json.parseToJsonElement(line) as? JsonObject }.getOrNull() ?: continue
-        // 首行若是 header（包含 user_name / character_name / chat_metadata 且无 mes 字段）则跳过消息构造
-        if (idx == 0 && !obj.containsKey("mes") && (obj.containsKey("user_name") || obj.containsKey("character_name") || obj.containsKey("chat_metadata"))) {
-            if (resolvedTitle.isBlank()) {
-                resolvedTitle = (obj["character_name"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-            }
+        // 首行若是 header（无 mes 且含 user_name / character_name / chat_metadata）则只记录元数据
+        if (idx == 0 && !obj.containsKey("mes") &&
+            (obj.containsKey("user_name") || obj.containsKey("character_name") || obj.containsKey("chat_metadata"))
+        ) {
+            headerCharacterName = (obj["character_name"] as? JsonPrimitive)?.contentOrNull
+                ?.takeUnless { it.isBlank() || it.equals("unused", ignoreCase = true) }
+            headerCreateDate = obj["create_date"]
+            rpClientMeta = (obj["chat_metadata"] as? JsonObject)?.get("rpclient") as? JsonObject
             continue
         }
+        val mes = (obj["mes"] as? JsonPrimitive)?.contentOrNull ?: continue
+        require(nodes.size < ST_JSONL_MAX_MESSAGES) { "Chat archive has too many messages" }
+        skippedImages += countStJsonlImages(obj)
+
         val isUser = (obj["is_user"] as? JsonPrimitive)?.booleanOrNull == true
         val isSystemHidden = (obj["is_system"] as? JsonPrimitive)?.booleanOrNull == true
+        // ST 的 is_system 表示 /hide 隐藏楼层；narrator 旁白同样按隐藏 assistant 消息保留，内容不丢。
+        val isNarrator = (obj["extra"] as? JsonObject)?.get("type")
+            ?.let { (it as? JsonPrimitive)?.contentOrNull }
+            ?.equals("narrator", ignoreCase = true) == true
         val name = (obj["name"] as? JsonPrimitive)?.contentOrNull
-        val mes = (obj["mes"] as? JsonPrimitive)?.contentOrNull.orEmpty()
         val swipesArr = (obj["swipes"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
         val swipeTexts = if (!swipesArr.isNullOrEmpty()) swipesArr else listOf(mes)
-        val swipeId = ((obj["swipe_id"] as? JsonPrimitive)?.intOrNull ?: 0).coerceIn(0, (swipeTexts.size - 1).coerceAtLeast(0))
+        val swipeId = ((obj["swipe_id"] as? JsonPrimitive)?.intOrNull ?: 0)
+            .coerceIn(0, (swipeTexts.size - 1).coerceAtLeast(0))
+
+        // 时间归一化：可解析且晚于前一条才采用，否则沿用前一条 +1ms，保证楼层顺序稳定。
+        val parsedMillis = parseStJsonlTimestamp(obj["send_date"])
+        val effectiveMillis = when {
+            parsedMillis != null && parsedMillis > previousMillis -> parsedMillis
+            previousMillis == Long.MIN_VALUE -> System.currentTimeMillis()
+            else -> previousMillis + 1L
+        }
+        previousMillis = effectiveMillis
+        if (firstMillis == null) firstMillis = effectiveMillis
+        lastMillis = effectiveMillis
+
         val role = if (isUser) MessageRole.USER else MessageRole.ASSISTANT
+        val createdAt = millisToStJsonlLocalDateTime(effectiveMillis)
         val messages = swipeTexts.map { text ->
             val base = UIMessage(
                 role = role,
                 parts = listOf(UIMessagePart.Text(text)),
                 name = name,
+                createdAt = createdAt,
             )
-            if (isSystemHidden) base.withHidden() else base.withoutHidden()
+            if (isSystemHidden || isNarrator) base.withHidden() else base.withoutHidden()
         }
         nodes += me.rerere.rikkahub.data.model.MessageNode(
             id = kotlin.uuid.Uuid.random(),
@@ -452,10 +523,102 @@ fun importConversationFromStJsonl(
             selectIndex = swipeId,
         )
     }
-    return Conversation(
-        id = kotlin.uuid.Uuid.random(),
-        assistantId = assistantId,
-        title = resolvedTitle.ifBlank { "Imported ST Chat" },
-        messageNodes = nodes,
+
+    val rpTitle = rpClientMeta?.stringField("title")
+    val resolvedTitle = rpTitle
+        ?: title.trim().takeIf { it.isNotEmpty() }
+        ?: headerCharacterName
+        ?: "Imported ST Chat"
+    val createMillis = rpClientMeta?.longField("create_time")?.let(::normalizeStJsonlEpoch)
+        ?: headerCreateDate?.let(::parseStJsonlTimestamp)
+        ?: firstMillis
+        ?: System.currentTimeMillis()
+    val updateMillis = maxOf(
+        rpClientMeta?.longField("latest_time")?.let(::normalizeStJsonlEpoch) ?: createMillis,
+        lastMillis ?: createMillis,
     )
+
+    return StJsonlImportResult(
+        conversation = Conversation(
+            id = kotlin.uuid.Uuid.random(),
+            assistantId = assistantId,
+            title = resolvedTitle,
+            messageNodes = nodes,
+            createAt = Instant.ofEpochMilli(createMillis),
+            updateAt = Instant.ofEpochMilli(updateMillis),
+        ),
+        messageCount = nodes.size,
+        skippedImages = skippedImages,
+    )
+}
+
+private fun JsonObject.stringField(key: String): String? =
+    (get(key) as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+
+private fun JsonObject.longField(key: String): Long? =
+    (get(key) as? JsonPrimitive)?.longOrNull
+
+/** 解析 send_date / create_date 等时间字段为 epoch 毫秒；兼容数字、ISO 时间与 ST 遗留格式。 */
+private fun parseStJsonlTimestamp(element: JsonElement?): Long? {
+    val primitive = element as? JsonPrimitive ?: return null
+    if (!primitive.isString) return primitive.longOrNull?.let(::normalizeStJsonlEpoch)
+    val text = primitive.content.trim()
+    if (text.isEmpty()) return null
+    text.toLongOrNull()?.let { return normalizeStJsonlEpoch(it) }
+    runCatching { return Instant.parse(text).toEpochMilli() }
+    runCatching { return OffsetDateTime.parse(text).toInstant().toEpochMilli() }
+    runCatching {
+        return LocalDateTime.parse(text, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+            .atZone(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+    }
+    stJsonlLegacySendDateRegex.matchEntire(text)?.destructured
+        ?.let { (year, month, day, hour, minute, second, millis) ->
+            runCatching {
+                return LocalDateTime.of(
+                    year.toInt(),
+                    month.toInt(),
+                    day.toInt(),
+                    hour.toInt(),
+                    minute.toInt(),
+                    second.toInt(),
+                    millis.toInt() * 1_000_000,
+                )
+                    .atZone(ZoneId.systemDefault())
+                    .toInstant()
+                    .toEpochMilli()
+            }
+        }
+    return null
+}
+
+private fun normalizeStJsonlEpoch(value: Long): Long =
+    if (value in -ST_JSONL_SECONDS_EPOCH_THRESHOLD..ST_JSONL_SECONDS_EPOCH_THRESHOLD) value * 1000L else value
+
+private fun millisToStJsonlLocalDateTime(millis: Long): kotlinx.datetime.LocalDateTime =
+    kotlinx.datetime.Instant.fromEpochMilliseconds(millis)
+        .toLocalDateTime(kotlinx.datetime.TimeZone.currentSystemDefault())
+
+/**
+ * 统计一行消息里的图片数量（仅用于导入提示，本导入器不恢复图片字节）。
+ * RPClient 私有 images 数组存在时优先计数，避免与酒馆原生字段重复统计。
+ */
+private fun countStJsonlImages(obj: JsonObject): Int {
+    val extra = obj["extra"] as? JsonObject ?: return 0
+    val rpImages = (extra["rpclient"] as? JsonObject)?.get("images") as? JsonArray
+    if (rpImages != null) return rpImages.size
+    var count = 0
+    (extra["media"] as? JsonArray)?.forEach { element ->
+        val item = element as? JsonObject ?: return@forEach
+        if (item.stringField("type")?.equals("image", ignoreCase = true) == true) count++
+    }
+    val urls = buildList {
+        (extra["image_swipes"] as? JsonArray)?.forEach { element ->
+            (element as? JsonPrimitive)?.contentOrNull?.let { add(it) }
+        }
+        extra.stringField("image")?.let { add(it) }
+    }.filter { it.isNotBlank() }.distinct()
+    count += urls.size
+    return count
 }

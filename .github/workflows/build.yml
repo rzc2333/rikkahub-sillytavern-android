@@ -7,8 +7,6 @@ on:
 
 jobs:
   build:
-    # 老 fork MiaoWuNYA/rikkahub-plus 已归档，只在新仓库构建
-    if: github.repository == 'MiaoWuNYA/rikkahub-sillytavern-android'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,9 +38,17 @@ jobs:
             echo "$KEY_BASE64" | base64 -d > app/app.key
             echo "$SIGNING_CONFIG" > local.properties
           else
-            # 密钥未配置时回退 debug 签名
+            # 密钥未配置时回退 debug 签名：仓库已自带 app.key 则直接复用，
+            # 否则现场生成一次性签名库，保证 assembleRelease 能完成签名
+            if [ ! -f app/app.key ]; then
+              keytool -genkeypair -v -keystore app/app.key -storetype PKCS12 \
+                -alias androiddebugkey -keypass android -storepass android \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
             cat > local.properties << 'EOF'
           storeFile=app.key
+          storeType=PKCS12
           storePassword=android
           keyAlias=androiddebugkey
           keyPassword=android
