@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -13,7 +14,6 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -353,7 +353,7 @@ class OpenAIProvider(
             }.mergeCustomBody(params.customBody)
         )
 
-        Log.i(TAG, "generateImageViaChat: $requestBody")
+        logRequestBody(TAG, "generateImageViaChat") { requestBody.toString() }
 
         val request = Request.Builder()
             .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
@@ -410,7 +410,7 @@ class OpenAIProvider(
             }.mergeCustomBody(params.customBody)
         )
 
-        Log.i(TAG, "generateImageViaChat(edit): ${params.images.size} reference image(s)")
+        logRequestBody(TAG, "generateImageViaChat(edit)") { "${params.images.size} reference image(s)" }
 
         val request = Request.Builder()
             .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
@@ -440,8 +440,6 @@ class OpenAIProvider(
         }
         return urls.map { downloadImageAsBase64(it) }
     }
-
-
 
     @OptIn(ExperimentalEncodingApi::class)
     private suspend fun editImageWithInputReferences(
